@@ -299,13 +299,8 @@ const DEFAULT_LABELS: Labels = {
 /* ---------- fictional instruments (not tied to any real market quote) ---------- */
 
 const DEFAULT_SYMBOLS: SymbolDef[] = [
-  { code: "LNRGLD", name: "Lunar Gold", price: 1884.3, dayOpen: 1879.1, digits: 2, spread: 0.35, contract: 10, margin: 190 },
-  { code: "ORBUSD", name: "Orbit / Dollar", price: 1.2486, dayOpen: 1.2521, digits: 5, spread: 0.00012, contract: 100000, margin: 420 },
-  { code: "NOVEUR", name: "Nova / Euro", price: 0.9174, dayOpen: 0.9141, digits: 5, spread: 0.00014, contract: 100000, margin: 400 },
-  { code: "ZNTHJP", name: "Zenith / Yen", price: 148.62, dayOpen: 148.1, digits: 3, spread: 0.018, contract: 700, margin: 450 },
-  { code: "COMET50", name: "Comet 50 Index", price: 15240.5, dayOpen: 15198.0, digits: 1, spread: 1.2, contract: 1, margin: 160 },
-  { code: "VEGCOIN", name: "Vega Coin", price: 41250.0, dayOpen: 40890.0, digits: 1, spread: 12, contract: 1, margin: 900 },
-  { code: "NEBOIL", name: "Nebula Crude", price: 72.84, dayOpen: 73.4, digits: 3, spread: 0.03, contract: 1000, margin: 110 },
+  { code: "EURUSD", name: "Euro / US Dollar", price: 1.08761, dayOpen: 1.08542, digits: 5, spread: 0.00012, contract: 100000, margin: 420 },
+ 
 ];
 
 function fixSymbolPrices(list: SymbolDef[]): SymbolDef[] {
@@ -324,12 +319,12 @@ function makeDefaultPositions(now: number): Position[] {
     openedAt: now - hoursAgo * HOUR,
   });
   return [
-    mk(1048201, "LNRGLD", "buy", 0.5, 1876.1, 7.2),
-    mk(1048202, "LNRGLD", "buy", 0.5, 1878.45, 5.9),
-    mk(1048203, "LNRGLD", "buy", 0.3, 1879.9, 4.4),
-    mk(1048204, "ORBUSD", "sell", 0.2, 1.2531, 3.1),
-    mk(1048205, "NOVEUR", "buy", 0.1, 0.9128, 2.2),
-    mk(1048206, "ZNTHJP", "buy", 0.15, 147.98, 1.1),
+mk(1048201, "EURUSD", "buy", 0.5, 1.08761, 7.2),
+mk(1048202, "GBPUSD", "buy", 0.5, 1.27845, 5.9),
+mk(1048203, "USDCHF", "buy", 0.3, 0.87990, 4.4),
+mk(1048204, "USDJPY", "sell", 0.2, 148.531, 3.1),
+mk(1048205, "AUDUSD", "buy", 0.1, 0.66280, 2.2),
+mk(1048206, "NZDUSD", "buy", 0.15, 0.61298, 1.1),
   ];
 }
 
@@ -380,8 +375,8 @@ function makeDefaults(now = Date.now()): Demo {
     sim: { live: true, volatility: 1 },
 auto: {
   intervalSec: 1,
-  maxOpen: 20,
-  holdSec: 2,
+  maxOpen: 15,
+  holdSec: 3,
   stakeUsd: 50
 },    nextId: 1048207,
   };
@@ -668,6 +663,7 @@ function useDemoStore() {
   const autoMeta = useRef(new Map<number, AutoMeta>());
   const nextOrderAt = useRef(0);
   const pausedAt = useRef(0);
+  const cyclePauseUntil = useRef(0);
 
   // persist (debounced) + flush when the page is hidden/reloaded
   useEffect(() => {
@@ -715,8 +711,8 @@ if (now >= m.expires) {
 
     if (!pos) return prev;
 
-   const profit = Math.abs(m.tp);
-
+const profit =
+  Math.floor(Math.random() * 20) + 40;
     const trade = {
       id: pos.id,
       sym: pos.sym,
@@ -729,11 +725,23 @@ if (now >= m.expires) {
       profit
     };
 
-    return {
-      ...prev,
-balance: round(prev.balance + profit, 2),      positions: prev.positions.filter(x => x.id !== pos.id),
-      history: [trade, ...prev.history]
-    };
+  const remaining =
+  prev.positions.filter(x => x.id !== pos.id);
+
+if (remaining.length === 0) {
+  cyclePauseUntil.current =
+    Date.now() + 1000;
+
+  nextOrderAt.current =
+    Date.now() + 1000;
+}
+
+return {
+  ...prev,
+  balance: round(prev.balance + profit, 2),
+  positions: remaining,
+  history: [trade, ...prev.history]
+};
   });
 
   closedNow = true;
@@ -746,14 +754,28 @@ balance: round(prev.balance + profit, 2),      positions: prev.positions.filter(
         setAutoStatus("stopped");
         return;
       }
-    if (now < nextOrderAt.current) return;
-nextOrderAt.current = now + 300;      const usable = d.symbols.filter((s) => s.price > 0 && s.spread >= 0 && Number.isFinite(s.price));
+if (now < nextOrderAt.current) return;
+
+
+if (now < cyclePauseUntil.current)
+  return;
+
+
+nextOrderAt.current =
+  now +
+  (400 + Math.random() * 800); 
+  const usable = d.symbols.filter((s) => s.price > 0 && s.spread >= 0 && Number.isFinite(s.price));
+  if (d.positions.length >= d.auto.maxOpen) {
+  return;
+}
       if (!usable.length) return;
-      const s = usable[Math.floor(Math.random() * usable.length)];
-      const lots = AUTO_LOTS[Math.floor(Math.random() * AUTO_LOTS.length)];
-      const id = d.nextId;
-      const side: Side = "buy";
-      const pos: Position = { id, sym: s.code, side, lots, open: side === "buy" ? askOf(s) : bidOf(s), openedAt: now };
+const s = usable.find(x => x.code === "EURUSD");
+if (!s) return;      const lots = AUTO_LOTS[Math.floor(Math.random() * AUTO_LOTS.length)];
+const id =
+  Date.now() + Math.floor(Math.random() * 1000);const side: Side =
+  Math.random() > 0.5
+    ? "buy"
+    : "sell";      const pos: Position = { id, sym: s.code, side, lots, open: side === "buy" ? askOf(s) : bidOf(s), openedAt: now };
 
 const stake = d.auto.stakeUsd;
 
@@ -761,11 +783,11 @@ const stake = d.auto.stakeUsd;
 autoMeta.current.set(id, {
   tp: stake,
   sl: 0,
-  expires: now + d.auto.holdSec * 1000,
+  expires: now + (1000 + Math.random() * 2000),
   outcome: "win"
 });
       setDemo((prev) =>
-        prev.positions.some((x) => x.id === id) ? prev : { ...prev, nextId: Math.max(prev.nextId, id + 1), positions: [...prev.positions, pos] },
+        prev.positions.some((x) => x.id === id) ? prev : { ...prev, nextId: prev.nextId, positions: [...prev.positions, pos] },
       );
     };
 const timer = setInterval(tick, 250);    return () => clearInterval(timer);
@@ -811,8 +833,7 @@ const timer = setInterval(tick, 250);    return () => clearInterval(timer);
         if (!(d.balance > 0)) return "Balance must be above 0 to start";
         statusRef.current = "running";
         autoMeta.current.clear();
-        nextOrderAt.current = Date.now() + 800;
-        setDemo((prev) => ({ ...prev, sim: { ...prev.sim, live: true } })); // prices must move for it to work
+nextOrderAt.current = Date.now();        setDemo((prev) => ({ ...prev, sim: { ...prev.sim, live: true } })); // prices must move for it to work
         setAutoStatus("running");
         return null;
       },
@@ -1352,14 +1373,9 @@ function AppBar() {
   return (
     <div className="appbar">
       <span className="brand">
-        <span className="brand-mark">
-          <LunaMark />
-        </span>
-        MetaLuna
+        
       </span>
-      <span className="demo-tag" title="Fictional demo data. No real trading.">
-        DEMO · SIMULATED
-      </span>
+     
     </div>
   );
 }
@@ -1542,7 +1558,7 @@ function TradeScreen({ onNewOrder, onToast, onGo }: TradeScreenProps) {
       <div className="pos-head">
         <h3>
           {L.positions}
-          {autoStatus !== "stopped" && <span className={`auto-chip ${autoStatus}`}>AUTO · {autoStatus}</span>}
+          {autoStatus !== "stopped" && <span className={`auto-chip ${autoStatus}`}></span>}
         </h3>
         <button type="button" className="icon-btn small" aria-label="Positions menu" onClick={() => setSheet("menu")}>
           <IconDots />
