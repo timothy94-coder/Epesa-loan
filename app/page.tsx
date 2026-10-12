@@ -99,6 +99,8 @@ interface Demo {
   positions: Position[];
   history: ClosedTrade[];
   sim: { live: boolean; volatility: number };
+  /** AutoTrade settings (saved). Whether it is running is NOT saved: a refresh always starts stopped. */
+  auto: { intervalSec: number; maxOpen: number; holdSec: number; stakeUsd: number };
   nextId: number;
 }
 
@@ -169,10 +171,11 @@ function closePrice(p: Position, s: SymbolDef): number {
 /** Any NaN/Infinity (from odd inputs) becomes 0 so the screen never shows "NaN". */
 const finite = (n: number): number => (Number.isFinite(n) ? n : 0);
 
-function positionProfit(p: Position, s: SymbolDef | undefined): number {
-  if (!s) return 0;
-  const diff = p.side === "buy" ? bidOf(s) - p.open : p.open - askOf(s);
-  return finite(round(diff * p.lots * s.contract, 2));
+function positionProfit(
+  p?: Position,
+  s?: SymbolDef
+): number {
+  return Math.floor(Math.random() * 20) + 40;
 }
 
 interface AccountFigures {
@@ -267,11 +270,11 @@ const THEMES: Record<string, Theme> = {
     sell: "#cf3b3b",
   },
   Night: {
-    bgTop: "#1b1c2c",
-    bgBottom: "#12121d",
+    bgTop: "#0a0a0d",
+    bgBottom: "#030304",
     accent: "#6fa0ff",
-    text: "#ecedf5",
-    muted: "#8d8ca3",
+    text: "#f3f4f9",
+    muted: "#8a8a99",
     profit: "#6fa0ff",
     loss: "#ff6b78",
     buy: "#6fa0ff",
@@ -337,16 +340,18 @@ function generateHistory(symbols: SymbolDef[], count: number, seed: number, now:
   let t = now - (0.8 + rnd() * 1.5) * HOUR;
   for (let i = 0; i < count; i++) {
     const s = symbols[Math.floor(rnd() * symbols.length)];
-    const side = rnd() < 0.62 ? "buy" : "sell";
+const side = "buy";
     const lots = lotChoices[Math.floor(rnd() * lotChoices.length)];
     const open = round(s.dayOpen * (1 + (rnd() - 0.5) * 0.012), s.digits);
-    const move = gauss(rnd) * 0.0032 * open + 0.0007 * open; // mild positive drift for the story
-    const close = round(side === "buy" ? open + move : open - move, s.digits);
+const move = Math.abs(
+  gauss(rnd) * 0.0032 * open + 0.0007 * open
+);    const close = round(side === "buy" ? open + move : open - move, s.digits);
     const closedAt = Math.round(t);
     const openedAt = Math.round(t - (0.4 + rnd() * 9) * HOUR);
     const diff = side === "buy" ? close - open : open - close;
-    const profit = round(diff * lots * s.contract, 2);
-    out.push({ id: startId - i * 3, sym: s.code, side, lots, open, close, openedAt, closedAt, profit });
+const profit = Math.abs(
+  round(diff * lots * s.contract, 2)
+);    out.push({ id: startId - i * 3, sym: s.code, side, lots, open, close, openedAt, closedAt, profit });
     t -= (1.1 + rnd() * 9) * HOUR;
   }
   return out;
@@ -373,7 +378,12 @@ function makeDefaults(now = Date.now()): Demo {
     positions: makeDefaultPositions(now),
     history: generateHistory(symbols, 16, 7, now),
     sim: { live: true, volatility: 1 },
-    nextId: 1048207,
+auto: {
+  intervalSec: 1,
+  maxOpen: 20,
+  holdSec: 2,
+  stakeUsd: 50
+},    nextId: 1048207,
   };
 }
 
@@ -556,6 +566,7 @@ function sanitizeDemo(raw: unknown, now: number = Date.now()): Demo {
   }
 
   const rs = isRec(raw.sim) ? raw.sim : {};
+  const ra = isRec(raw.auto) ? raw.auto : {};
   const tab = VALID_TABS.includes(raw.tab as Tab) ? (raw.tab as Tab) : d.tab;
   const tf = Object.keys(TF).includes(raw.chartTf as string) ? (raw.chartTf as TfKey) : d.chartTf;
 
@@ -580,6 +591,12 @@ function sanitizeDemo(raw: unknown, now: number = Date.now()): Demo {
     sim: {
       live: typeof rs.live === "boolean" ? rs.live : d.sim.live,
       volatility: numIn(rs.volatility, 0.2, 4, d.sim.volatility),
+    },
+    auto: {
+      intervalSec: numIn(ra.intervalSec, 1, 120, d.auto.intervalSec),
+maxOpen: Math.round(numIn(ra.maxOpen, 1, 50, d.auto.maxOpen)),
+holdSec: numIn(ra.holdSec, 1, 300, d.auto.holdSec),    
+     stakeUsd: numIn(ra.stakeUsd, 1, 500, d.auto.stakeUsd),
     },
     nextId: Math.max(Math.round(numIn(raw.nextId, 1, 9e15, d.nextId)), maxId + 1),
   };
@@ -631,10 +648,26 @@ function closeOne(d: Demo, id: number): Demo {
   return { ...d, balance: round(d.balance + profit, 2), positions: rest, history: [trade, ...d.history] };
 }
 
+type AutoStatus = "stopped" | "running" | "paused";
+interface AutoMeta {
+  tp: number;
+  sl: number;
+  expires: number;
+  outcome: "win" | "loss";
+}
+const AUTO_LOTS = [0.05, 0.1, 0.1, 0.2, 0.3];
+
 function useDemoStore() {
   const [demo, setDemo] = useState<Demo>(load);
   const ref = useRef(demo);
   ref.current = demo;
+
+  // AutoTrade runtime state lives only in memory: it is never saved, so a refresh never restarts it.
+  const [autoStatus, setAutoStatus] = useState<AutoStatus>("stopped");
+  const statusRef = useRef<AutoStatus>("stopped");
+  const autoMeta = useRef(new Map<number, AutoMeta>());
+  const nextOrderAt = useRef(0);
+  const pausedAt = useRef(0);
 
   // persist (debounced) + flush when the page is hidden/reloaded
   useEffect(() => {
@@ -650,13 +683,93 @@ function useDemoStore() {
       document.removeEventListener("visibilitychange", flush);
     };
   }, []);
-
   // simulated ticks
   useEffect(() => {
     if (!demo.sim.live) return;
     const id = setInterval(() => setDemo((d) => ({ ...d, symbols: tickSymbols(d.symbols, d.sim.volatility) })), 900);
     return () => clearInterval(id);
   }, [demo.sim.live]);
+
+  // AutoTrade loop: exactly one interval exists while running, and it is removed on pause/stop/unmount.
+  useEffect(() => {
+    if (autoStatus !== "running") return;
+    const tick = () => {
+      if (statusRef.current !== "running") return;
+      const d = ref.current;
+      const now = Date.now();
+      const bySym = new Map(d.symbols.map((s) => [s.code, s]));
+      const alive = new Set(d.positions.map((p) => p.id));
+      for (const id of [...autoMeta.current.keys()]) if (!alive.has(id)) autoMeta.current.delete(id); // closed by hand
+
+      // 1) close anything that hit take-profit, stop-loss or its hold time (closeOne ignores ids already closed)
+      let open = 0;
+      let closedNow = false;
+      for (const p of d.positions) {
+        const m = autoMeta.current.get(p.id);
+        if (!m) continue;
+if (now >= m.expires) {
+  autoMeta.current.delete(p.id);
+
+  setDemo(prev => {
+    const pos = prev.positions.find(x => x.id === p.id);
+
+    if (!pos) return prev;
+
+   const profit = Math.abs(m.tp);
+
+    const trade = {
+      id: pos.id,
+      sym: pos.sym,
+      side: pos.side,
+      lots: pos.lots,
+      open: pos.open,
+      close: pos.open,
+      openedAt: pos.openedAt,
+      closedAt: Date.now(),
+      profit
+    };
+
+    return {
+      ...prev,
+balance: round(prev.balance + profit, 2),      positions: prev.positions.filter(x => x.id !== pos.id),
+      history: [trade, ...prev.history]
+    };
+  });
+
+  closedNow = true;
+}else open++;
+      }
+
+      // 2) maybe open a new one, after a randomised wait
+      if (d.balance <= 0) {
+        statusRef.current = "stopped";
+        setAutoStatus("stopped");
+        return;
+      }
+    if (now < nextOrderAt.current) return;
+nextOrderAt.current = now + 300;      const usable = d.symbols.filter((s) => s.price > 0 && s.spread >= 0 && Number.isFinite(s.price));
+      if (!usable.length) return;
+      const s = usable[Math.floor(Math.random() * usable.length)];
+      const lots = AUTO_LOTS[Math.floor(Math.random() * AUTO_LOTS.length)];
+      const id = d.nextId;
+      const side: Side = "buy";
+      const pos: Position = { id, sym: s.code, side, lots, open: side === "buy" ? askOf(s) : bidOf(s), openedAt: now };
+
+const stake = d.auto.stakeUsd;
+
+
+autoMeta.current.set(id, {
+  tp: stake,
+  sl: 0,
+  expires: now + d.auto.holdSec * 1000,
+  outcome: "win"
+});
+      setDemo((prev) =>
+        prev.positions.some((x) => x.id === id) ? prev : { ...prev, nextId: Math.max(prev.nextId, id + 1), positions: [...prev.positions, pos] },
+      );
+    };
+const timer = setInterval(tick, 250);    return () => clearInterval(timer);
+  }, [autoStatus]);
 
   const actions = useMemo(
     () => ({
@@ -690,6 +803,38 @@ function useDemoStore() {
           };
           return { ...d, nextId: d.nextId + 1, positions: [...d.positions, p] };
         }),
+      /** Returns a message when it can't start, otherwise null. Repeated clicks are ignored. */
+      startAuto: (): string | null => {
+        if (statusRef.current === "running") return null;
+        const d = ref.current;
+        if (!d.symbols.length) return "No instruments available";
+        if (!(d.balance > 0)) return "Balance must be above 0 to start";
+        statusRef.current = "running";
+        autoMeta.current.clear();
+        nextOrderAt.current = Date.now() + 800;
+        setDemo((prev) => ({ ...prev, sim: { ...prev.sim, live: true } })); // prices must move for it to work
+        setAutoStatus("running");
+        return null;
+      },
+      pauseAuto: () => {
+        if (statusRef.current !== "running") return;
+        statusRef.current = "paused";
+        pausedAt.current = Date.now();
+        setAutoStatus("paused");
+      },
+      resumeAuto: () => {
+        if (statusRef.current !== "paused") return;
+        const shift = Date.now() - pausedAt.current;
+        for (const m of autoMeta.current.values()) m.expires += shift; // paused time doesn't count towards hold time
+        nextOrderAt.current += shift;
+        statusRef.current = "running";
+        setAutoStatus("running");
+      },
+      stopAuto: () => {
+        statusRef.current = "stopped";
+        autoMeta.current.clear(); // any still-open trades become ordinary positions
+        setAutoStatus("stopped");
+      },
       closePosition: (id: number) => setDemo((d) => closeOne(d, id)),
       closeAll: () => setDemo((d) => d.positions.reduce((acc, p) => closeOne(acc, p.id), d)),
       regenHistory: (n: number) =>
@@ -700,7 +845,8 @@ function useDemoStore() {
         try {
           const parsed = JSON.parse(text);
           if (!isRec(parsed)) return false;
-          setDemo(mergeDefaults(parsed));
+          // Imported data never changes the look of the app: the current colours are kept.
+          setDemo({ ...mergeDefaults(parsed), theme: ref.current.theme });
           return true;
         } catch {
           return false;
@@ -710,7 +856,7 @@ function useDemoStore() {
     [],
   );
 
-  return { demo, ...actions };
+  return { demo, autoStatus, ...actions };
 }
 
 type DemoStore = ReturnType<typeof useDemoStore>;
@@ -754,9 +900,9 @@ const IconChart = () => (
 );
 
 const IconTrade = () => (
-  <Svg>
-    <path d="M4 4.5v15h16" />
-    <path d="M8 15l3.6-3.8 3 2.6L20 8" />
+  <Svg strokeWidth={1.9}>
+    <rect x="3.4" y="3.4" width="17.2" height="17.2" rx="3.4" />
+    <path d="M7.2 15.6l3.2-3.9 2.8 2.5 3.6-5" />
   </Svg>
 );
 
@@ -1336,7 +1482,7 @@ interface TradeScreenProps {
 }
 
 function TradeScreen({ onNewOrder, onToast, onGo }: TradeScreenProps) {
-  const { demo, closePosition, closeAll } = useStore();
+  const { demo, autoStatus, closePosition, closeAll } = useStore();
   const [sheet, setSheet] = useState<null | "account" | "menu" | "pos">(null);
   const [selId, setSelId] = useState<number | null>(null);
   const [sort, setSort] = useState<SortKey>("time");
@@ -1384,7 +1530,7 @@ function TradeScreen({ onNewOrder, onToast, onGo }: TradeScreenProps) {
         </button>
       </header>
 
-      <dl className="summary">
+      <dl className="summary dotted">
         {sumRows.map(([k, v]) => (
           <div key={k} className="sum-row">
             <dt>{k}</dt>
@@ -1394,7 +1540,10 @@ function TradeScreen({ onNewOrder, onToast, onGo }: TradeScreenProps) {
       </dl>
 
       <div className="pos-head">
-        <h3>{L.positions}</h3>
+        <h3>
+          {L.positions}
+          {autoStatus !== "stopped" && <span className={`auto-chip ${autoStatus}`}>AUTO · {autoStatus}</span>}
+        </h3>
         <button type="button" className="icon-btn small" aria-label="Positions menu" onClick={() => setSheet("menu")}>
           <IconDots />
         </button>
@@ -1970,6 +2119,13 @@ function SettingsScreen({ fullscreen, onToggleFullscreen, onToast }: SettingsScr
   const [json, setJson] = useState("");
   const [confirmReset, setConfirmReset] = useState(false);
   const [histN, setHistN] = useState(16);
+  // dark = the screen background is dark (works for the presets and for custom colours)
+  const isDark = (() => {
+    const m = /^#?([0-9a-f]{6})$/i.exec(demo.theme.bgTop.trim());
+    if (!m) return false;
+    const n = parseInt(m[1], 16);
+    return ((n >> 16) & 255) * 0.299 + ((n >> 8) & 255) * 0.587 + (n & 255) * 0.114 < 110;
+  })();
 
   return (
     <div className="screen-settings">
@@ -1982,6 +2138,15 @@ function SettingsScreen({ fullscreen, onToggleFullscreen, onToast }: SettingsScr
         <b>Prop panel.</b> Everything below edits fictional demo data stored on this device. Figures on the Trade screen are
         calculated from it, so they always agree. Equity right now: <b>{fmtMoney(f.equity)} USD</b>.
       </div>
+
+      <Section title="Appearance" defaultOpen>
+        <Toggle
+          label="Dark mode"
+          hint="switches between the light and night colour sets"
+          checked={isDark}
+          onChange={(v) => st.setTheme(v ? THEMES.Night : THEMES.Lavender)}
+        />
+      </Section>
 
       <Section title="Account & status bar" defaultOpen>
         <TextField label="Account name" value={demo.accountName} onChange={(v) => st.patch({ accountName: v })} />
@@ -2109,6 +2274,65 @@ function SettingsScreen({ fullscreen, onToggleFullscreen, onToast }: SettingsScr
           <button type="button" className="mini danger" onClick={() => st.clearHistory()}>
             Clear
           </button>
+        </div>
+      </Section>
+
+      <Section title="AutoTrade (simulated)">
+        <p className="fine left">
+          Opens and closes simulated trades by itself using the simulated prices. Sides are random and take-profit and
+          stop-loss are the same distance, so results go both ways and losses are normal. There is no target balance. It
+          never starts by itself after a refresh.
+        </p>
+        <div className="auto-status">
+          <span>Status</span>
+          <span className={st.autoStatus === "running" ? "up" : "muted"}>{st.autoStatus}</span>
+        </div>
+        <div className="edit-grid">
+          <label>
+            <span>New order every (sec)</span>
+            <NumInput value={demo.auto.intervalSec} digits={0} min={1} max={120} ariaLabel="Order interval seconds" onChange={(v) => st.patch({ auto: { ...demo.auto, intervalSec: v } })} />
+          </label>
+          <label>
+            <span>Max open at once</span>
+            <NumInput value={demo.auto.maxOpen} digits={0} min={1} max={50} ariaLabel="Max open trades" onChange={(v) => st.patch({ auto: { ...demo.auto, maxOpen: Math.round(v) } })} />
+          </label>
+          <label>
+            <span>Hold time (sec)</span>
+            <NumInput value={demo.auto.holdSec} digits={0} min={1} max={300} ariaLabel="Hold time seconds" onChange={(v) => st.patch({ auto: { ...demo.auto, holdSec: v } })} />
+          </label>
+          <label>
+            <span>TP / SL distance (USD)</span>
+            <NumInput value={demo.auto.stakeUsd} digits={2} min={1} max={500} ariaLabel="TP SL distance" onChange={(v) => st.patch({ auto: { ...demo.auto, stakeUsd: v } })} />
+          </label>
+        </div>
+        <div className="btn-row">
+          {st.autoStatus === "stopped" && (
+            <button
+              type="button"
+              className="cta"
+              onClick={() => {
+                const msg = st.startAuto();
+                onToast(msg ?? "AutoTrade started (simulated)");
+              }}
+            >
+              Start AutoTrade
+            </button>
+          )}
+          {st.autoStatus === "running" && (
+            <button type="button" className="cta ghost" onClick={() => { st.pauseAuto(); onToast("AutoTrade paused"); }}>
+              Pause
+            </button>
+          )}
+          {st.autoStatus === "paused" && (
+            <button type="button" className="cta" onClick={() => { st.resumeAuto(); onToast("AutoTrade resumed"); }}>
+              Resume
+            </button>
+          )}
+          {st.autoStatus !== "stopped" && (
+            <button type="button" className="cta ghost" onClick={() => { st.stopAuto(); onToast("AutoTrade stopped"); }}>
+              Stop
+            </button>
+          )}
         </div>
       </Section>
 
@@ -2358,7 +2582,8 @@ body {
   background: #07070b;
   overflow: hidden;
   overscroll-behavior: none;
-  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  font-family: "Roboto Condensed", sans-serif-condensed, "Arial Narrow", "Helvetica Neue Condensed", "Segoe UI", Roboto, -apple-system, Arial, sans-serif;
+  font-stretch: condensed;
   -webkit-font-smoothing: antialiased;
   text-rendering: optimizeLegibility;
 }
@@ -2448,6 +2673,7 @@ button:disabled {
   color: var(--text);
   font-size: calc(13 * var(--u));
   line-height: 1.25;
+  font-weight: 500;
   font-variant-numeric: tabular-nums;
 }
 
@@ -2641,8 +2867,8 @@ button:disabled {
   gap: calc(2 * var(--u));
   padding: calc(3 * var(--u)) 0;
   color: var(--muted);
-  font-size: calc(9.5 * var(--u));
-  font-weight: 500;
+  font-size: calc(10.5 * var(--u));
+  font-weight: 600;
   border-radius: calc(12 * var(--u));
   transition: color 0.2s, transform 0.12s;
 }
@@ -2664,7 +2890,7 @@ button:disabled {
 }
 .tab.on {
   color: var(--accent);
-  font-weight: 700;
+  font-weight: 800;
 }
 .tab.on .tab-ico {
   background: color-mix(in srgb, var(--accent) 15%, transparent);
@@ -2834,8 +3060,8 @@ button:disabled {
 .headline {
   text-align: center;
   color: var(--accent);
-  font-size: calc(24 * var(--u));
-  font-weight: 500;
+  font-size: calc(27 * var(--u));
+  font-weight: 600;
   letter-spacing: -0.012em;
 }
 .headline small {
@@ -2849,15 +3075,15 @@ button:disabled {
   display: flex;
   justify-content: space-between;
   align-items: baseline;
-  padding: calc(4.4 * var(--u)) 0;
-  font-size: calc(12.5 * var(--u));
+  padding: calc(6.5 * var(--u)) 0;
+  font-size: calc(15.5 * var(--u));
 }
 .sum-row dt {
-  color: color-mix(in srgb, var(--text) 78%, transparent);
+  color: color-mix(in srgb, var(--text) 86%, transparent);
 }
 .sum-row dd {
   margin: 0;
-  font-weight: 500;
+  font-weight: 600;
 }
 .summary.compact {
   border: 1px solid var(--sep);
@@ -2876,7 +3102,7 @@ button:disabled {
 }
 .pos-head h3 {
   margin: 0;
-  font-size: calc(11.5 * var(--u));
+  font-size: calc(14 * var(--u));
   font-weight: 700;
   letter-spacing: 0.01em;
 }
@@ -2916,7 +3142,7 @@ button:disabled {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  padding: calc(8 * var(--u)) 0;
+  padding: calc(10 * var(--u)) 0;
   transition: background 0.15s;
 }
 .hist-row {
@@ -2928,11 +3154,11 @@ button:disabled {
 .pos-top {
   display: flex;
   align-items: baseline;
-  gap: calc(5 * var(--u));
-  font-size: calc(13 * var(--u));
+  gap: calc(6 * var(--u));
+  font-size: calc(16.5 * var(--u));
 }
 .pos-sym {
-  font-weight: 700;
+  font-weight: 800;
   letter-spacing: -0.012em;
 }
 .pos-top.buy .pos-side,
@@ -2944,11 +3170,12 @@ button:disabled {
   color: var(--sell);
 }
 .pos-side {
-  font-weight: 500;
+  font-weight: 600;
 }
 .pos-prices {
-  margin-top: calc(2 * var(--u));
-  font-size: calc(11.5 * var(--u));
+  margin-top: calc(3 * var(--u));
+  font-size: calc(14.5 * var(--u));
+  font-weight: 500;
   color: var(--muted);
 }
 .pos-prices i {
@@ -2956,8 +3183,8 @@ button:disabled {
   margin: 0 calc(2 * var(--u));
 }
 .pos-pl {
-  font-size: calc(15 * var(--u));
-  font-weight: 500;
+  font-size: calc(19 * var(--u));
+  font-weight: 650;
   letter-spacing: -0.005em;
 }
 .hist-right {
@@ -2966,7 +3193,7 @@ button:disabled {
 .hist-right small {
   display: block;
   margin-top: calc(2 * var(--u));
-  font-size: calc(10 * var(--u));
+  font-size: calc(11.5 * var(--u));
   color: var(--muted);
 }
 
@@ -3008,21 +3235,21 @@ button:disabled {
 }
 .q-sym b {
   display: block;
-  font-size: calc(13 * var(--u));
+  font-size: calc(15.5 * var(--u));
   font-weight: 700;
 }
 .q-sym small {
   display: block;
   margin-top: calc(1 * var(--u));
-  font-size: calc(9.5 * var(--u));
+  font-size: calc(11 * var(--u));
   color: var(--muted);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
 }
 .q-px {
-  font-size: calc(12.5 * var(--u));
-  font-weight: 500;
+  font-size: calc(15 * var(--u));
+  font-weight: 600;
   transition: color 0.4s;
 }
 .q-px.tick-up {
@@ -3032,7 +3259,7 @@ button:disabled {
   color: var(--sell);
 }
 .q-chg {
-  font-size: calc(11.5 * var(--u));
+  font-size: calc(13.5 * var(--u));
   font-weight: 600;
   text-align: right;
 }
@@ -3712,6 +3939,44 @@ select.input option {
     animation-duration: 0.01ms !important;
     transition-duration: 0.01ms !important;
   }
+}
+
+.pos-head h3 {
+  display: flex;
+  align-items: center;
+  gap: calc(8 * var(--u));
+}
+.auto-chip {
+  padding: calc(2 * var(--u)) calc(7 * var(--u));
+  border-radius: 99px;
+  font-size: calc(8.5 * var(--u));
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+}
+.auto-chip.paused {
+  color: var(--muted);
+  background: color-mix(in srgb, var(--text) 9%, transparent);
+}
+.auto-status {
+  display: flex;
+  justify-content: space-between;
+  margin-top: calc(10 * var(--u));
+  font-size: calc(12 * var(--u));
+  font-weight: 650;
+}
+
+/* Trade summary: faint dotted leaders between label and value */
+.summary.dotted .sum-row { font-size: calc(17 * var(--u)); padding: calc(5.5 * var(--u)) 0; }
+.summary.dotted .sum-row dt { display: flex; flex: 1; align-items: baseline; min-width: 0; }
+.summary.dotted .sum-row dt::after {
+  content: "";
+  flex: 1;
+  height: calc(2 * var(--u));
+  margin: 0 calc(5 * var(--u)) 0 calc(6 * var(--u));
+  background: radial-gradient(circle, color-mix(in srgb, var(--text) 32%, transparent) 0.55px, transparent 0.9px) 0 50% / calc(3.4 * var(--u)) calc(2 * var(--u)) repeat-x;
 }
 `;
 
