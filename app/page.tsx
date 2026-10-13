@@ -175,7 +175,9 @@ function positionProfit(
   p?: Position,
   s?: SymbolDef
 ): number {
-  return Math.floor(Math.random() * 20) + 40;
+  return Math.round(
+    ((Math.random() * 20) - 10) * 100
+  ) / 100;
 }
 
 interface AccountFigures {
@@ -319,12 +321,6 @@ function makeDefaultPositions(now: number): Position[] {
     openedAt: now - hoursAgo * HOUR,
   });
   return [
-mk(1048201, "EURUSD", "buy", 0.5, 1.08761, 7.2),
-mk(1048202, "GBPUSD", "buy", 0.5, 1.27845, 5.9),
-mk(1048203, "USDCHF", "buy", 0.3, 0.87990, 4.4),
-mk(1048204, "USDJPY", "sell", 0.2, 148.531, 3.1),
-mk(1048205, "AUDUSD", "buy", 0.1, 0.66280, 2.2),
-mk(1048206, "NZDUSD", "buy", 0.15, 0.61298, 1.1),
   ];
 }
 
@@ -375,8 +371,8 @@ function makeDefaults(now = Date.now()): Demo {
     sim: { live: true, volatility: 1 },
 auto: {
   intervalSec: 1,
-  maxOpen: 15,
-  holdSec: 3,
+  maxOpen: 20,
+  holdSec: 4,
   stakeUsd: 50
 },    nextId: 1048207,
   };
@@ -664,6 +660,8 @@ function useDemoStore() {
   const nextOrderAt = useRef(0);
   const pausedAt = useRef(0);
   const cyclePauseUntil = useRef(0);
+  const cycleCloseAt = useRef(0);
+  const cycleSide = useRef<Side>("buy");
 
   // persist (debounced) + flush when the page is hidden/reloaded
   useEffect(() => {
@@ -711,8 +709,9 @@ if (now >= m.expires) {
 
     if (!pos) return prev;
 
-const profit =
-  Math.floor(Math.random() * 20) + 40;
+const profit = Math.round(
+  (Math.random() * 16 + 2) * 100
+) / 100;
     const trade = {
       id: pos.id,
       sym: pos.sym,
@@ -730,17 +729,20 @@ const profit =
 
 if (remaining.length === 0) {
   cyclePauseUntil.current =
-    Date.now() + 1000;
+    Date.now() + 1000; // 10 seconds
 
   nextOrderAt.current =
-    Date.now() + 1000;
+    Date.now() + 200;
 }
 
 return {
   ...prev,
   balance: round(prev.balance + profit, 2),
   positions: remaining,
-  history: [trade, ...prev.history]
+  history: [trade, ...prev.history],
+  nextId: remaining.length === 0
+    ? Date.now()
+    : prev.nextId
 };
   });
 
@@ -762,35 +764,68 @@ if (now < cyclePauseUntil.current)
 
 
 nextOrderAt.current =
-  now +
-  (400 + Math.random() * 800); 
+  now + d.auto.intervalSec * 1000;
+
   const usable = d.symbols.filter((s) => s.price > 0 && s.spread >= 0 && Number.isFinite(s.price));
-  if (d.positions.length >= d.auto.maxOpen) {
+  
+ if (d.positions.length >= d.auto.maxOpen) {
+
+  const ids = d.positions.map(p => p.id);
+
+  ids.forEach(id => {
+    const meta = autoMeta.current.get(id);
+
+    if (meta) {
+      meta.expires = Date.now();
+    }
+  });
+
   return;
 }
       if (!usable.length) return;
 const s = usable.find(x => x.code === "EURUSD");
 if (!s) return;      const lots = AUTO_LOTS[Math.floor(Math.random() * AUTO_LOTS.length)];
 const id =
-  Date.now() + Math.floor(Math.random() * 1000);const side: Side =
-  Math.random() > 0.5
-    ? "buy"
-    : "sell";      const pos: Position = { id, sym: s.code, side, lots, open: side === "buy" ? askOf(s) : bidOf(s), openedAt: now };
+  Date.now() + Math.floor(Math.random() * 1000);
+
+if (d.positions.length === 0) {
+  cycleSide.current =
+    Math.random() > 0.5
+      ? "buy"
+      : "sell";
+
+  cycleCloseAt.current =
+    now + d.auto.holdSec * 1000;
+}
+
+const side: Side = cycleSide.current;
+
+const pos: Position = {
+  id,
+  sym: s.code,
+  side,
+  lots,
+  open:
+    side === "buy"
+      ? askOf(s)
+      : bidOf(s),
+  openedAt: now
+};
 
 const stake = d.auto.stakeUsd;
-
 
 autoMeta.current.set(id, {
   tp: stake,
   sl: 0,
-  expires: now + (1000 + Math.random() * 2000),
+  expires: cycleCloseAt.current,
   outcome: "win"
 });
+
       setDemo((prev) =>
         prev.positions.some((x) => x.id === id) ? prev : { ...prev, nextId: prev.nextId, positions: [...prev.positions, pos] },
       );
     };
-const timer = setInterval(tick, 250);    return () => clearInterval(timer);
+const timer = setInterval(tick, 25);   return () => clearInterval(timer);
   }, [autoStatus]);
 
   const actions = useMemo(
@@ -1524,13 +1559,19 @@ function TradeScreen({ onNewOrder, onToast, onGo }: TradeScreenProps) {
     onToast("Position closed (simulated)");
   };
 
-  const sumRows: [string, string][] = [
-    [L.balance, fmtMoney(f.balance)],
-    [L.equity, fmtMoney(f.equity)],
-    [L.margin, fmtMoney(f.margin)],
-    [L.freeMargin, fmtMoney(f.freeMargin)],
-    [L.marginLevel, fmtMoney(f.marginLevel)],
-  ];
+const sumRows: [string, string][] =
+  demo.positions.length === 0
+    ? [
+        [L.balance, fmtMoney(f.balance)],
+        [L.equity, fmtMoney(f.equity)],
+        [L.freeMargin, fmtMoney(f.freeMargin)],
+      ]
+    : [
+        [L.balance, fmtMoney(f.balance)],
+        [L.equity, fmtMoney(f.equity)],
+        [L.margin, fmtMoney(f.margin)],
+        [L.freeMargin, fmtMoney(f.freeMargin)],
+      ];
 
   return (
     <div className="screen-trade">
@@ -1538,9 +1579,18 @@ function TradeScreen({ onNewOrder, onToast, onGo }: TradeScreenProps) {
         <button type="button" className="icon-btn" aria-label="Account details" onClick={() => setSheet("account")}>
           <IconCard />
         </button>
-        <div className="headline" aria-label="Account equity">
-          {fmtMoney(f.equity)} <small>USD</small>
-        </div>
+      <div
+  className={`headline ${
+    f.profit > 0
+      ? "up"
+      : f.profit < 0
+      ? "down"
+      : ""
+  }`}
+>
+  {fmtMoney(f.profit)}
+  <small> USD</small>
+</div>
         <button type="button" className="icon-btn" aria-label="New order" onClick={onNewOrder}>
           <IconPlus />
         </button>
@@ -1555,28 +1605,38 @@ function TradeScreen({ onNewOrder, onToast, onGo }: TradeScreenProps) {
         ))}
       </dl>
 
-      <div className="pos-head">
-        <h3>
-          {L.positions}
-          {autoStatus !== "stopped" && <span className={`auto-chip ${autoStatus}`}></span>}
-        </h3>
-        <button type="button" className="icon-btn small" aria-label="Positions menu" onClick={() => setSheet("menu")}>
-          <IconDots />
-        </button>
-      </div>
+{demo.positions.length > 0 && (
+  <>
+    <div className="pos-head">
+      <h3>
+        {L.positions}
+        {autoStatus !== "stopped" && (
+          <span className={`auto-chip ${autoStatus}`}></span>
+        )}
+      </h3>
 
-      <div className="pos-list">
-        {rows.length === 0 && <p className="empty">No open positions</p>}
-        {rows.map(({ p, s, profit }) => (
-          <SwipeRow
-            key={p.id}
-            actionLabel="Close"
-            onAction={() => close(p.id)}
-            onTap={() => {
-              setSelId(p.id);
-              setSheet("pos");
-            }}
-          >
+      <button
+        type="button"
+        className="icon-btn small"
+        aria-label="Positions menu"
+        onClick={() => setSheet("menu")}
+      >
+        <IconDots />
+      </button>
+    </div>
+
+    <div className="pos-list">
+      {rows.map(({ p, s, profit }) => (
+        <SwipeRow
+          key={p.id}
+          actionLabel="Close"
+          onAction={() => close(p.id)}
+          onTap={() => {
+            setSelId(p.id);
+            setSheet("pos");
+          }}
+        >
+
             <div className="pos-row">
               <div className="pos-main">
                 <div className={`pos-top ${p.side}`}>
@@ -1633,6 +1693,10 @@ function TradeScreen({ onNewOrder, onToast, onGo }: TradeScreenProps) {
           </button>
         </div>
       </Sheet>
+
+       
+  </>
+)}
 
       {/* Position details */}
       <Sheet open={sheet === "pos" && !!selected} onClose={() => setSheet(null)} title={selected ? `${selected.sym} · ${selected.side} ${selected.lots}` : ""}>
@@ -2754,8 +2818,8 @@ button:disabled {
   position: relative;
   z-index: 3;
   flex: none;
-  height: calc(46 * var(--u));
-  padding: calc(13 * var(--u)) calc(18 * var(--u)) 0 calc(32 * var(--u));
+  height: calc(30 * var(--u));
+  padding: calc(1 * var(--u)) calc(18 * var(--u)) 0 calc(24 * var(--u));
   display: flex;
   justify-content: space-between;
   align-items: flex-start;
@@ -2791,7 +2855,7 @@ button:disabled {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  height: calc(28 * var(--u));
+  height: calc(2 * var(--u));
   padding: 0 calc(16 * var(--u));
 }
 .brand {
@@ -3079,6 +3143,13 @@ button:disabled {
   font-size: calc(27 * var(--u));
   font-weight: 600;
   letter-spacing: -0.012em;
+}
+.headline.up {
+  color: var(--profit);
+}
+
+.headline.down {
+  color: var(--loss);
 }
 .headline small {
   font-size: 0.86em;
